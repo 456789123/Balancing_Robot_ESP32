@@ -1,5 +1,6 @@
 /*
   https://github.com/mahowik/BalancingWii/tree/master
+
 */
 
 #include <Wire.h>
@@ -12,21 +13,33 @@
 #define DIR_RIGHT 19
 #define STEP_RIGHT 18
 
-#define INTERVAL 4000
+#define INTERVAL 3800
 
-#define KP 10.0   // proporcional
-#define KI 0.0    // integral
-#define KD 2.0    // derivativo
+// PID 1 (Angle control)
+#define KP_ANGLE 10.0
+#define KI_ANGLE 0.0
+#define KD_ANGLE 2.5
 
-#define SETPOINT 0 // target angle (upright)
+// PID 2 (Motor control smoothing)
+#define KP_MOTOR 0.12  // suavização ainda mais lenta
+#define KI_MOTOR 0.0
+#define KD_MOTOR 0.0
+
+#define SETPOINT 0
 #define INTEGRAL_MAX 1000
-#define DEAD_ZONE 0.5  // zona morta
+#define SPEED_STEPS 2450
 
 double angle, gyroMicros;
+double lastErrorAngle = 0;
+double integralAngle = 0;
+double pidAngleOutput = 0;
 
-double lastError = 0;
-double integral = 0;
-double pidOutput = 0;
+double lastErrorMotor = 0;
+double integralMotor = 0;
+double pidMotorOutput = 0;
+
+double smoothedMotorCommandOne = 0;
+double smoothedMotorCommandTwo = 0;
 
 unsigned long previousMicros;
 unsigned long currentMicros;
@@ -54,39 +67,46 @@ void readMPU() {
   double angleGyro = yGyro * deltaGyroTime;
   double angleAcc = atan2(-yAcc, zAcc) * RAD_TO_DEG;
 
-  angle = (0.9 * (angle + angleGyro) + 0.1 * (angleAcc)) - SETPOINT;
+  // Filtro suavizado
+  angle = 0.95 * (angle + angleGyro) + 0.05 * (angleAcc) - SETPOINT;
 }
 
-void calculate_PID() {
-  double error = -angle;
-/*
-  if (abs(error) < DEAD_ZONE) {
-    pidOutput = 0;
-    integral = 0;
-    return;
-  }
-*/
-  integral += error;
-  if (integral > INTEGRAL_MAX) integral = INTEGRAL_MAX;
-  if (integral < -INTEGRAL_MAX) integral = -INTEGRAL_MAX;
+double calculateAnglePID(double input) {
+  double error = -input;
 
-  double derivative = error - lastError;
-  lastError = error;
+  integralAngle += error;
+  if (integralAngle > INTEGRAL_MAX) integralAngle = INTEGRAL_MAX;
+  if (integralAngle < -INTEGRAL_MAX) integralAngle = -INTEGRAL_MAX;
 
-  pidOutput = KP * error + KI * integral + KD * derivative;
-  pidOutput *= -0.1;
+  double derivative = error - lastErrorAngle;
+  lastErrorAngle = error;
 
-  /*
-  Serial.print("angle = ");
-  Serial.print(angle);
-  Serial.print(" pidOutput = ");
-  Serial.println(pidOutput);
-  */
+  double output = KP_ANGLE * error + KI_ANGLE * integralAngle + KD_ANGLE * derivative;
+  output *= -0.1;
+
+  // Limitar saída bruta do primeiro PID
+  output = constrain(output, -500, 500);
+
+  return output;
+}
+
+double calculateMotorPID(double target, double current) {
+  double error = target - current;
+
+  integralMotor += error;
+  if (integralMotor > INTEGRAL_MAX) integralMotor = INTEGRAL_MAX;
+  if (integralMotor < -INTEGRAL_MAX) integralMotor = -INTEGRAL_MAX;
+
+  double derivative = error - lastErrorMotor;
+  lastErrorMotor = error;
+
+  double output = KP_MOTOR * error + KI_MOTOR * integralMotor + KD_MOTOR * derivative;
+
+  return output;
 }
 
 void setup() {
   Serial.begin(115200);
-
   Wire.begin();
 
   Wire.beginTransmission(MPU_ADDR);
@@ -112,24 +132,39 @@ void loop() {
   if ((currentMicros - previousMicros) >= INTERVAL) {
     previousMicros = currentMicros;
 
-    calculate_PID();
+    pidAngleOutput = calculateAnglePID(angle);
 
-    int motorSpeed = constrain(abs(pidOutput), 0, 800);
-    bool direction = (pidOutput > 0);
+    // PID motor suavizado em cascata
+    double nextCommand = smoothedMotorCommandOne + calculateMotorPID(pidAngleOutput, smoothedMotorCommandOne);
+
+    // Rampagem: limitar mudança brusca
+    double maxChange = 10;
+    double delta = nextCommand - smoothedMotorCommandTwo;
+    if (delta > maxChange) delta = maxChange;
+    if (delta < -maxChange) delta = -maxChange;
+
+    smoothedMotorCommandTwo += delta;
+
+    smoothedMotorCommandTwo = constrain(smoothedMotorCommandTwo, -800, 800);
+
+    int motorSpeed = constrain(abs(smoothedMotorCommandTwo), 0, 800);
+    bool direction = (smoothedMotorCommandTwo > 0);
 
     digitalWrite(DIR_RIGHT, direction ? LOW : HIGH);
     digitalWrite(DIR_LEFT, direction ? HIGH : LOW);
 
-    int steps = map(motorSpeed, 0, 800, 0, 50);  // ajusta 50 conforme necessário
-    int pulseDelay = map(motorSpeed, 0, 800, 870, 200);  // adjust as needed
+    if (motorSpeed > 0) {
+      int numSteps = map(motorSpeed, 0, 800, 1, 20);
 
-    for (int i = 0; i < steps; i++) {
-      digitalWrite(STEP_LEFT, HIGH);
-      digitalWrite(STEP_RIGHT, HIGH);
-      delayMicroseconds(pulseDelay);
-      digitalWrite(STEP_LEFT, LOW);
-      digitalWrite(STEP_RIGHT, LOW);
-      delayMicroseconds(pulseDelay);
+      for (int i = 0; i < numSteps; i++) {
+        digitalWrite(STEP_LEFT, HIGH);
+        digitalWrite(STEP_RIGHT, HIGH);
+        delayMicroseconds(SPEED_STEPS);
+        digitalWrite(STEP_LEFT, LOW);
+        digitalWrite(STEP_RIGHT, LOW);
+        delayMicroseconds(SPEED_STEPS);
+      }
     }
   }
 }
+
