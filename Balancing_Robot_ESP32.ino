@@ -1,107 +1,72 @@
 /*
-  Balancing Robot ESP32 - V18 Teste Final - Setpoint 0.285 + Self Balance Limitado
+  Balancing Robot ESP32 - V22 PD/PID Simples + REST + Drive
+  MPU6050 -> Kalman simples -> PD/PID -> PWM -> BTS7960
 
-  Mudanca principal:
-  - Substitui mpu.getAngleX() por um filtro de Kalman proprio.
-  - O filtro combina:
-      * acelerometro: referencia absoluta de inclinacao;
-      * giroscopio: resposta rapida.
-  - Quando o modulo da aceleracao se afasta de 1 g, o filtro reduz
-    automaticamente a confianca no acelerometro. Isso ajuda quando
-    o MPU6050 esta montado longe do eixo das rodas.
+  Defaults:
+    setpoint = 3.00
+    Kp = 15.0
+    Ki = 0.0
+    Kd = 0.12
+    PWM_MAX = 180
+    FALL_ANGLE_DEG = 35.0
+    INTEGRAL_LIMIT = 100.0
+    CONTROL_PERIOD_US = 5000
 
-  IMPORTANTE:
-  - Isto nao elimina completamente o problema mecanico causado pelo
-    sensor no topo da estrutura.
-  - A melhor posicao continua sendo perto do eixo das rodas.
-  - Ajuste ACC_ANGLE_DIRECTION e GYRO_DIRECTION caso o sentido esteja errado.
-  - O MPU6050 deve ficar completamente imovel durante a calibracao.
+  REST:
+    GET  /api/state
+    POST /api/config
+    POST /api/reset
+    GET  /api/health
+
+  Troque WIFI_SSID e WIFI_PASSWORD.
+  Fallback AP:
+    SSID: STARK_BALANCER
+    senha: starkrobot
+    IP: 192.168.4.1
 */
 
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <MPU6050_light.h>
 #include <math.h>
 
-// ============================================================
-// MPU6050
-// ============================================================
+const char* WIFI_SSID = "Star_Gate";
+const char* WIFI_PASSWORD = "STARgate$321";
+const char* AP_SSID = "STARK_BALANCER";
+const char* AP_PASSWORD = "starkrobot";
+
+WebServer server(80);
 
 #define MPU_SDA 21
 #define MPU_SCL 22
-
 MPU6050 mpu(Wire);
 
-// Inverta um destes sinais caso angulo e giro estejam ao contrario.
 constexpr double ACC_ANGLE_DIRECTION = 1.0;
 constexpr double GYRO_DIRECTION = 1.0;
-
-// Pequeno ajuste mecanico do angulo calculado pelo acelerometro.
 constexpr double ACC_ANGLE_OFFSET_DEG = 0.0;
-
-// ============================================================
-// Filtro de Kalman 1D
-// Estado estimado:
-//   angle = angulo
-//   bias  = erro constante do giroscopio
-// ============================================================
 
 class KalmanAngle {
 public:
-  void setAngle(const double initialAngle) {
-    angle = initialAngle;
-  }
+  void setAngle(const double initialAngle) { angle = initialAngle; }
 
-  void setProcessNoise(
-    const double newQAngle,
-    const double newQBias
-  ) {
-    qAngle = newQAngle;
-    qBias = newQBias;
-  }
+  double update(const double measuredAngle, const double measuredRate, const double dt) {
+    const double rate = measuredRate - bias;
+    angle += dt * rate;
 
-  void setMeasurementNoise(const double newRMeasure) {
-    rMeasure = newRMeasure;
-  }
-
-  double update(
-    const double measuredAngle,
-    const double measuredRate,
-    const double dt
-  ) {
-    // Predicao.
-    const double unbiasedRate = measuredRate - bias;
-    angle += dt * unbiasedRate;
-
-    // Atualizacao da matriz de covariancia.
-    p00 += dt * (
-      dt * p11 -
-      p01 -
-      p10 +
-      qAngle
-    );
-
+    p00 += dt * (dt * p11 - p01 - p10 + qAngle);
     p01 -= dt * p11;
     p10 -= dt * p11;
     p11 += qBias * dt;
 
-    // Inovacao: diferenca entre acelerometro e predicao.
-    const double innovation =
-        measuredAngle - angle;
+    const double innovation = measuredAngle - angle;
+    const double s = p00 + rMeasure;
+    const double k0 = p00 / s;
+    const double k1 = p10 / s;
 
-    const double innovationCovariance =
-        p00 + rMeasure;
-
-    const double k0 =
-        p00 / innovationCovariance;
-
-    const double k1 =
-        p10 / innovationCovariance;
-
-    // Correcao do estado.
     angle += k0 * innovation;
     bias += k1 * innovation;
 
-    // Correcao da covariancia.
     const double oldP00 = p00;
     const double oldP01 = p01;
 
@@ -113,55 +78,21 @@ public:
     return angle;
   }
 
-  double getBias() const {
-    return bias;
-  }
-
 private:
   double qAngle = 0.001;
   double qBias = 0.003;
   double rMeasure = 0.03;
-
   double angle = 0.0;
   double bias = 0.0;
-
-  double p00 = 0.0;
-  double p01 = 0.0;
-  double p10 = 0.0;
-  double p11 = 0.0;
+  double p00 = 0.0, p01 = 0.0, p10 = 0.0, p11 = 0.0;
 };
 
-KalmanAngle angleKalman;
-
-// ============================================================
-// Kalman adaptativo
-// ============================================================
-
-// Ruido normal de medicao quando o acelerometro esta proximo de 1 g.
-constexpr double KALMAN_R_MEASURE_NORMAL = 0.03;
-
-// Ruido maximo durante forte aceleracao linear/centripeta.
-// Quanto maior, menos o acelerometro influencia.
-constexpr double KALMAN_R_MEASURE_MOVING = 2.50;
-
-// Comeca a reduzir a confianca quando |modulo - 1g| passa deste valor.
-constexpr double ACCEL_DEVIATION_START_G = 0.04;
-
-// A partir deste desvio usa praticamente apenas o giroscopio.
-constexpr double ACCEL_DEVIATION_FULL_G = 0.30;
-
-// Filtro leve do modulo de aceleracao para evitar mudancas bruscas.
-constexpr double ACCEL_MAG_FILTER_ALPHA = 0.15;
-
-// ============================================================
-// IBT-2 / BTS7960
-// ============================================================
+KalmanAngle kalman;
 
 #define LEFT_RPWM 25
 #define LEFT_LPWM 26
 #define LEFT_REN  27
 #define LEFT_LEN  14
-
 #define RIGHT_RPWM 32
 #define RIGHT_LPWM 33
 #define RIGHT_REN  16
@@ -170,13 +101,8 @@ constexpr double ACCEL_MAG_FILTER_ALPHA = 0.15;
 constexpr bool INVERT_LEFT_MOTOR = false;
 constexpr bool INVERT_RIGHT_MOTOR = true;
 
-// ============================================================
-// PWM
-// ============================================================
-
 constexpr uint32_t PWM_FREQUENCY = 20000;
 constexpr uint8_t PWM_RESOLUTION = 8;
-
 constexpr int PWM_ZERO_BAND = 3;
 
 constexpr int PWM_MIN_LEFT_FORWARD  = 18;
@@ -184,136 +110,363 @@ constexpr int PWM_MIN_LEFT_REVERSE  = 18;
 constexpr int PWM_MIN_RIGHT_FORWARD = 18;
 constexpr int PWM_MIN_RIGHT_REVERSE = 18;
 
-// ============================================================
-// Controle
-// ============================================================
+constexpr double DEFAULT_SETPOINT = -1.50;
+constexpr double DEFAULT_KP = 15.0;
+constexpr double DEFAULT_KI = 0.0;
+constexpr double DEFAULT_KD = 0.13;
+constexpr int DEFAULT_PWM_MAX = 180;
+constexpr double DEFAULT_FALL_ANGLE_DEG = 35.0;
+constexpr double DEFAULT_INTEGRAL_LIMIT = 100.0;
+constexpr uint32_t DEFAULT_CONTROL_PERIOD_US = 5000;
 
-// Ponto mecanico base que funcionava melhor na V10.
-// O MPU6050 esta DEITADO/HORIZONTAL sob o ESP32.
-// Para esta montagem usamos pitch em torno de X:
-//   Acc angle = atan2(AY, AZ)
-//   Gyro rate = GX
-double setpoint = -1.20;
+double setpoint = DEFAULT_SETPOINT;
+double Kp = DEFAULT_KP;
+double Ki = DEFAULT_KI;
+double Kd = DEFAULT_KD;
+int PWM_MAX = DEFAULT_PWM_MAX;
+double FALL_ANGLE_DEG = DEFAULT_FALL_ANGLE_DEG;
+double INTEGRAL_LIMIT = DEFAULT_INTEGRAL_LIMIT;
+uint32_t CONTROL_PERIOD_US = DEFAULT_CONTROL_PERIOD_US;
 
-// Correcao dinamica aprendida enquanto o robo esta quase em pe,
-// mas ainda insiste em andar para um dos lados.
-double selfBalanceOffset = 0.0;
+constexpr double MIN_SETPOINT = -15.0, MAX_SETPOINT = 15.0;
+constexpr double MIN_KP = 0.0, MAX_KP = 100.0;
+constexpr double MIN_KI = 0.0, MAX_KI = 20.0;
+constexpr double MIN_KD = 0.0, MAX_KD = 5.0;
+constexpr int MIN_PWM_MAX = 0, MAX_PWM_MAX = 255;
+constexpr double MIN_FALL_ANGLE = 5.0, MAX_FALL_ANGLE = 80.0;
+constexpr double MIN_INTEGRAL_LIMIT = 0.0, MAX_INTEGRAL_LIMIT = 1000.0;
+constexpr uint32_t MIN_CONTROL_PERIOD_US = 2000;
+constexpr uint32_t MAX_CONTROL_PERIOD_US = 20000;
 
-// Janela onde o auto-balance pode aprender.
-// Fora dela, a prioridade e recuperar o angulo, nao "aprender".
-constexpr double SELF_BALANCE_LEARN_WINDOW_DEG = 3.0;
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
-// So aprende quando existe comando real, mas sem saturacao.
-constexpr double SELF_BALANCE_MIN_OUTPUT = 10.0;
-constexpr double SELF_BALANCE_MAX_OUTPUT = 180.0;
+double telemetryAccAngle = 0.0;
+double telemetryAngle = 0.0;
+double telemetryGyro = 0.0;
+double telemetryError = 0.0;
+double telemetryPTerm = 0.0;
+double telemetryITerm = 0.0;
+double telemetryDTerm = 0.0;
+double telemetryPidOutput = 0.0;
+double telemetryLoopHz = 0.0;
+int telemetryPwm = 0;
+bool telemetryFallen = false;
 
-// Passo por ciclo de 5 ms. Comecamos conservadores.
-// Ajuste fino: aprende bem devagar para nao "inventar" um novo
-// ponto de equilibrio por causa de atrito externo (ex.: fio na roda).
-constexpr double SELF_BALANCE_STEP = 0.0002;
+double integral = 0.0;
+TaskHandle_t controlTaskHandle = nullptr;
 
-// Limite de seguranca para o ajuste automatico.
-// O SelfSP agora e apenas TRIM fino. Nunca pode compensar varios graus.
-constexpr double SELF_BALANCE_LIMIT_DEG = 0.30;
+enum DriveCommand { DRIVE_STOP=0, DRIVE_FORWARD, DRIVE_BACKWARD, DRIVE_LEFT, DRIVE_RIGHT };
+volatile DriveCommand driveCommand = DRIVE_STOP;
+volatile uint32_t lastDriveCommandMs = 0;
+double MOVE_OFFSET_DEG = 0.30;
+int TURN_PWM = 25;
+constexpr uint32_t DRIVE_TIMEOUT_MS = 300;
 
-// So deixa o auto-balance aprender quando o acelerometro
-// ainda possui alguma confianca no Kalman adaptativo.
-constexpr double SELF_BALANCE_MIN_ACC_TRUST = 0.20;
+double calculateAccelerometerAngle(const double ax, const double ay, const double az) {
+  (void)ax;
+  return atan2(ay, az) * RAD_TO_DEG * ACC_ANGLE_DIRECTION + ACC_ANGLE_OFFSET_DEG;
+}
 
-constexpr double Ki = 0.0;
-constexpr double FALL_ANGLE_DEG = 35.0;
-constexpr double GAIN_TRANSITION_END_DEG = 5.0;
+int compensateMotorDeadZone(int command, int minForward, int minReverse, int pwmMax) {
+  command = constrain(command, -pwmMax, pwmMax);
+  const int magnitude = abs(command);
+  if (magnitude <= PWM_ZERO_BAND) return 0;
+  if (command > 0 && magnitude < minForward) return minForward;
+  if (command < 0 && magnitude < minReverse) return -minReverse;
+  return command;
+}
 
-constexpr double KP_CENTER = 10.0;
-constexpr double KD_CENTER = 0.18;
-constexpr int PWM_MAX_CENTER = 140;
+void setMotor(int rpwmPin, int lpwmPin, int command, bool invert, int minForward, int minReverse, int pwmMax) {
+  command = constrain(command, -pwmMax, pwmMax);
+  if (invert) command = -command;
+  command = compensateMotorDeadZone(command, minForward, minReverse, pwmMax);
 
-constexpr double KP_RECOVERY = 16.0;
-constexpr double KD_RECOVERY = 0.20;
-constexpr int PWM_MAX_RECOVERY = 220;
+  if (command > 0) {
+    ledcWrite(rpwmPin, command);
+    ledcWrite(lpwmPin, 0);
+  } else if (command < 0) {
+    ledcWrite(rpwmPin, 0);
+    ledcWrite(lpwmPin, -command);
+  } else {
+    ledcWrite(rpwmPin, 0);
+    ledcWrite(lpwmPin, 0);
+  }
+}
 
-constexpr double GYRO_FILTER_ALPHA = 0.15;
+void stopMotors() {
+  ledcWrite(LEFT_RPWM, 0);
+  ledcWrite(LEFT_LPWM, 0);
+  ledcWrite(RIGHT_RPWM, 0);
+  ledcWrite(RIGHT_LPWM, 0);
+}
 
-constexpr double OUTPUT_ALPHA_CENTER = 0.18;
-constexpr double OUTPUT_ALPHA_RECOVERY = 0.62;
+void addCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
 
-constexpr int PWM_STEP_CENTER = 4;
-constexpr int PWM_STEP_RECOVERY = 18;
-constexpr int PWM_REVERSAL_STEP = 24;
+void sendJson(int code, const String& body) {
+  addCorsHeaders();
+  server.send(code, "application/json", body);
+}
 
-constexpr double CENTER_ZONE_DEG = 1.5;
-constexpr double ANGLE_ERROR_DEADBAND_DEG = 0.04;
+void handleOptions() {
+  addCorsHeaders();
+  server.send(204);
+}
 
-// ============================================================
-// Estado compartilhado
-// ============================================================
+void handleState() {
+  double accAngle, angle, gyro, err, p, i, d, pid, loopHz;
+  int pwm;
+  bool fallen;
+  double sp, kp, ki, kd, fallAngle, integralLimit;
+  int pwmMax;
+  uint32_t periodUs;
 
-volatile int motorCommand = 0;
-volatile bool emergencyStop = false;
+  portENTER_CRITICAL(&stateMux);
+  accAngle = telemetryAccAngle;
+  angle = telemetryAngle;
+  gyro = telemetryGyro;
+  err = telemetryError;
+  p = telemetryPTerm;
+  i = telemetryITerm;
+  d = telemetryDTerm;
+  pid = telemetryPidOutput;
+  pwm = telemetryPwm;
+  fallen = telemetryFallen;
+  loopHz = telemetryLoopHz;
 
-int appliedMotorCommand = 0;
+  sp = setpoint; kp = Kp; ki = Ki; kd = Kd;
+  pwmMax = PWM_MAX;
+  fallAngle = FALL_ANGLE_DEG;
+  integralLimit = INTEGRAL_LIMIT;
+  periodUs = CONTROL_PERIOD_US;
+  portEXIT_CRITICAL(&stateMux);
 
-double input = 0.0;
-double accelerometerAngle = 0.0;
-double angularVelocity = 0.0;
-double error = 0.0;
-double output = 0.0;
-double effectiveSetpoint = 0.285;
+  String json = "{";
+  json += "\"telemetry\":{";
+  json += "\"accAngle\":" + String(accAngle,4) + ",";
+  json += "\"angle\":" + String(angle,4) + ",";
+  json += "\"gyro\":" + String(gyro,4) + ",";
+  json += "\"error\":" + String(err,4) + ",";
+  json += "\"p\":" + String(p,4) + ",";
+  json += "\"i\":" + String(i,4) + ",";
+  json += "\"d\":" + String(d,4) + ",";
+  json += "\"pid\":" + String(pid,4) + ",";
+  json += "\"pwm\":" + String(pwm) + ",";
+  json += "\"fallen\":" + String(fallen ? "true" : "false") + ",";
+  json += "\"loopHz\":" + String(loopHz,1);
+  json += "},\"config\":{";
+  json += "\"setpoint\":" + String(sp,4) + ",";
+  json += "\"kp\":" + String(kp,4) + ",";
+  json += "\"ki\":" + String(ki,4) + ",";
+  json += "\"kd\":" + String(kd,4) + ",";
+  json += "\"pwmMax\":" + String(pwmMax) + ",";
+  json += "\"fallAngle\":" + String(fallAngle,4) + ",";
+  json += "\"integralLimit\":" + String(integralLimit,4) + ",";
+  json += "\"controlPeriodUs\":" + String(periodUs) + ",";
+  json += "\"moveOffset\":" + String(MOVE_OFFSET_DEG,4) + ",";
+  json += "\"turnPwm\":" + String(TURN_PWM);
+  json += "}}";
 
-double activeKp = KP_CENTER;
-double activeKd = KD_CENTER;
-int activePwmMax = PWM_MAX_CENTER;
+  sendJson(200, json);
+}
 
-double filteredGyro = 0.0;
-double filteredOutput = 0.0;
-double filteredAccelerationMagnitude = 1.0;
-double accelerometerTrust = 1.0;
-double activeKalmanR = KALMAN_R_MEASURE_NORMAL;
+void handleConfig() {
+  // Parseia antes da secao critica.
+  const bool hasSetpoint = server.hasArg("setpoint");
+  const bool hasKp = server.hasArg("kp");
+  const bool hasKi = server.hasArg("ki");
+  const bool hasKd = server.hasArg("kd");
+  const bool hasPwmMax = server.hasArg("pwmMax");
+  const bool hasFallAngle = server.hasArg("fallAngle");
+  const bool hasIntegralLimit = server.hasArg("integralLimit");
+  const bool hasPeriod = server.hasArg("controlPeriodUs");
 
-TaskHandle_t pidTaskHandle = nullptr;
+  const double newSetpoint = hasSetpoint ? constrain(server.arg("setpoint").toDouble(), MIN_SETPOINT, MAX_SETPOINT) : 0;
+  const double newKp = hasKp ? constrain(server.arg("kp").toDouble(), MIN_KP, MAX_KP) : 0;
+  const double newKi = hasKi ? constrain(server.arg("ki").toDouble(), MIN_KI, MAX_KI) : 0;
+  const double newKd = hasKd ? constrain(server.arg("kd").toDouble(), MIN_KD, MAX_KD) : 0;
+  const int newPwmMax = hasPwmMax ? constrain(server.arg("pwmMax").toInt(), MIN_PWM_MAX, MAX_PWM_MAX) : 0;
+  const double newFallAngle = hasFallAngle ? constrain(server.arg("fallAngle").toDouble(), MIN_FALL_ANGLE, MAX_FALL_ANGLE) : 0;
+  const double newIntegralLimit = hasIntegralLimit ? constrain(server.arg("integralLimit").toDouble(), MIN_INTEGRAL_LIMIT, MAX_INTEGRAL_LIMIT) : 0;
+  const uint32_t newPeriod = hasPeriod
+    ? (uint32_t)constrain(server.arg("controlPeriodUs").toInt(), (int)MIN_CONTROL_PERIOD_US, (int)MAX_CONTROL_PERIOD_US)
+    : 0;
 
-// ============================================================
-// Prototipos
-// ============================================================
+  portENTER_CRITICAL(&stateMux);
+  if (hasSetpoint) setpoint = newSetpoint;
+  if (hasKp) Kp = newKp;
+  if (hasKi) Ki = newKi;
+  if (hasKd) Kd = newKd;
+  if (hasPwmMax) PWM_MAX = newPwmMax;
+  if (hasFallAngle) FALL_ANGLE_DEG = newFallAngle;
+  if (hasIntegralLimit) INTEGRAL_LIMIT = newIntegralLimit;
+  if (hasPeriod) CONTROL_PERIOD_US = newPeriod;
+  portEXIT_CRITICAL(&stateMux);
 
-void pidLoop(void *parameter);
-void motorControl();
+  sendJson(200, "{\"ok\":true}");
+}
 
-double calculateAccelerometerAngleX(
-  double ax,
-  double ay,
-  double az
-);
 
-double updateAdaptiveMeasurementNoise(
-  double accelerationMagnitude
-);
+void handleDrive() {
+  if (!server.hasArg("command")) { sendJson(400, "{\"ok\":false}"); return; }
+  String c=server.arg("command"); c.toLowerCase();
+  DriveCommand cmd=DRIVE_STOP;
+  if(c=="forward") cmd=DRIVE_FORWARD; else if(c=="backward") cmd=DRIVE_BACKWARD;
+  else if(c=="left") cmd=DRIVE_LEFT; else if(c=="right") cmd=DRIVE_RIGHT;
+  else if(c!="stop") { sendJson(400, "{\"ok\":false}"); return; }
+  double mo = server.hasArg("moveOffset") ? constrain(server.arg("moveOffset").toDouble(),0.0,5.0) : MOVE_OFFSET_DEG;
+  int tp = server.hasArg("turnPwm") ? constrain(server.arg("turnPwm").toInt(),0,100) : TURN_PWM;
+  portENTER_CRITICAL(&stateMux); driveCommand=cmd; lastDriveCommandMs=millis(); MOVE_OFFSET_DEG=mo; TURN_PWM=tp; portEXIT_CRITICAL(&stateMux);
+  sendJson(200, "{\"ok\":true}");
+}
 
-void updateControlParameters(double absoluteError);
+void handleReset() {
+  portENTER_CRITICAL(&stateMux);
+  setpoint = DEFAULT_SETPOINT;
+  Kp = DEFAULT_KP;
+  Ki = DEFAULT_KI;
+  Kd = DEFAULT_KD;
+  PWM_MAX = DEFAULT_PWM_MAX;
+  FALL_ANGLE_DEG = DEFAULT_FALL_ANGLE_DEG;
+  INTEGRAL_LIMIT = DEFAULT_INTEGRAL_LIMIT;
+  CONTROL_PERIOD_US = DEFAULT_CONTROL_PERIOD_US;
+  MOVE_OFFSET_DEG = 0.30; TURN_PWM = 25; driveCommand = DRIVE_STOP;
+  integral = 0.0;
+  portEXIT_CRITICAL(&stateMux);
 
-void setMotor(
-  int rpwmPin,
-  int lpwmPin,
-  int command,
-  bool invert,
-  int minForward,
-  int minReverse
-);
+  sendJson(200, "{\"ok\":true,\"reset\":true}");
+}
 
-void stopMotors();
+void handleHealth() {
+  sendJson(200, "{\"ok\":true,\"name\":\"STARK_BALANCER\"}");
+}
 
-int compensateMotorDeadZone(
-  int command,
-  int minForward,
-  int minReverse
-);
+void startNetwork() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-int moveToward(int current, int target, int step);
-int commandSign(int value);
+  Serial.print("Conectando ao Wi-Fi");
+  const uint32_t start = millis();
 
-// ============================================================
-// Setup
-// ============================================================
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP do ESP32: http://");
+    Serial.println(WiFi.localIP());
+    return;
+  }
+
+  Serial.println("Wi-Fi falhou. Iniciando AP...");
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  Serial.print("SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("IP do ESP32: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+void controlTask(void* parameter) {
+  uint32_t previousMicros = micros();
+  uint32_t nextCycle = previousMicros;
+
+  while (true) {
+    double localSetpoint, localKp, localKi, localKd, localFallAngle, localIntegralLimit;
+    int localPwmMax;
+    uint32_t localPeriodUs;
+
+    portENTER_CRITICAL(&stateMux);
+    localSetpoint = setpoint;
+    localKp = Kp;
+    localKi = Ki;
+    localKd = Kd;
+    localPwmMax = PWM_MAX;
+    localFallAngle = FALL_ANGLE_DEG;
+    localIntegralLimit = INTEGRAL_LIMIT;
+    localPeriodUs = CONTROL_PERIOD_US;
+    portEXIT_CRITICAL(&stateMux);
+
+    const uint32_t now = micros();
+    if ((int32_t)(now - nextCycle) < 0) {
+      delayMicroseconds(100);
+      continue;
+    }
+
+    nextCycle = now + localPeriodUs;
+
+    const double dt = constrain((now - previousMicros) * 0.000001, 0.001, 0.050);
+    previousMicros = now;
+
+    mpu.update();
+
+    const double ax = mpu.getAccX();
+    const double ay = mpu.getAccY();
+    const double az = mpu.getAccZ();
+    const double accAngle = calculateAccelerometerAngle(ax, ay, az);
+    const double gyroRate = mpu.getGyroX() * GYRO_DIRECTION;
+    const double angle = kalman.update(accAngle, gyroRate, dt);
+
+    DriveCommand localDrive; uint32_t localLast; double localMove; int localTurn;
+    portENTER_CRITICAL(&stateMux); localDrive=driveCommand; localLast=lastDriveCommandMs; localMove=MOVE_OFFSET_DEG; localTurn=TURN_PWM; portEXIT_CRITICAL(&stateMux);
+    if(localDrive!=DRIVE_STOP && millis()-localLast>DRIVE_TIMEOUT_MS){ localDrive=DRIVE_STOP; portENTER_CRITICAL(&stateMux); driveCommand=DRIVE_STOP; portEXIT_CRITICAL(&stateMux); }
+    double commandedSetpoint=localSetpoint; int turnMix=0;
+    if(localDrive==DRIVE_FORWARD) commandedSetpoint=localSetpoint+localMove;
+    else if(localDrive==DRIVE_BACKWARD) commandedSetpoint=localSetpoint-localMove;
+    else if(localDrive==DRIVE_LEFT) turnMix=-localTurn;
+    else if(localDrive==DRIVE_RIGHT) turnMix=localTurn;
+
+    double error = 0, pTerm = 0, iTerm = 0, dTerm = 0, pidOutput = 0;
+    int pwm = 0;
+    bool fallen = false;
+
+    if (fabs(angle - commandedSetpoint) > localFallAngle) {
+      fallen = true;
+      integral = 0.0;
+      stopMotors();
+    } else {
+      error = commandedSetpoint - angle;
+      pTerm = localKp * error;
+
+      integral += error * dt;
+      integral = constrain(integral, -localIntegralLimit, localIntegralLimit);
+      iTerm = localKi * integral;
+
+      dTerm = -localKd * gyroRate;
+      pidOutput = constrain(pTerm + iTerm + dTerm, -(double)localPwmMax, (double)localPwmMax);
+      pwm = (int)lround(pidOutput);
+
+      const int leftCommand=constrain(pwm-turnMix,-localPwmMax,localPwmMax);
+      const int rightCommand=constrain(pwm+turnMix,-localPwmMax,localPwmMax);
+      setMotor(LEFT_RPWM, LEFT_LPWM, leftCommand, INVERT_LEFT_MOTOR, PWM_MIN_LEFT_FORWARD, PWM_MIN_LEFT_REVERSE, localPwmMax);
+      setMotor(RIGHT_RPWM, RIGHT_LPWM, rightCommand, INVERT_RIGHT_MOTOR, PWM_MIN_RIGHT_FORWARD, PWM_MIN_RIGHT_REVERSE, localPwmMax);
+    }
+
+    const double loopHz = dt > 0 ? 1.0 / dt : 0.0;
+
+    portENTER_CRITICAL(&stateMux);
+    telemetryAccAngle = accAngle;
+    telemetryAngle = angle;
+    telemetryGyro = gyroRate;
+    telemetryError = error;
+    telemetryPTerm = pTerm;
+    telemetryITerm = iTerm;
+    telemetryDTerm = dTerm;
+    telemetryPidOutput = pidOutput;
+    telemetryPwm = pwm;
+    telemetryFallen = fallen;
+    telemetryLoopHz = loopHz;
+    portEXIT_CRITICAL(&stateMux);
+  }
+}
 
 void setup() {
   Serial.begin(115200);
@@ -322,45 +475,26 @@ void setup() {
   Wire.setClock(400000);
 
   const byte status = mpu.begin();
-
   if (status != 0) {
-    Serial.print("Falha ao conectar no MPU6050. Codigo: ");
+    Serial.print("Falha MPU6050. Codigo: ");
     Serial.println(status);
-
-    while (true) {
-      delay(1000);
-    }
+    while (true) delay(1000);
   }
 
-  Serial.println();
-  Serial.println("MPU6050 inicializado.");
-  Serial.println("Mantenha o robo totalmente imovel durante a calibracao.");
+  Serial.println("V22 - PD/PID SIMPLES + REST + HOLD-TO-DRIVE");
+  Serial.println("Nao mova o robo durante a calibracao.");
 
   delay(1000);
   mpu.calcOffsets(true, true);
 
-  // Faz uma primeira leitura para inicializar o Kalman sem salto.
-  for (int i = 0; i < 50; i++) {
+  for (int i = 0; i < 100; i++) {
     mpu.update();
     delay(5);
   }
 
-  const double initialAx = mpu.getAccX();
-  const double initialAy = mpu.getAccY();
-  const double initialAz = mpu.getAccZ();
-
   const double initialAngle =
-      calculateAccelerometerAngleX(
-        initialAx,
-        initialAy,
-        initialAz
-      );
-
-  angleKalman.setProcessNoise(0.001, 0.003);
-  angleKalman.setMeasurementNoise(KALMAN_R_MEASURE_NORMAL);
-  angleKalman.setAngle(initialAngle);
-
-  input = initialAngle;
+      calculateAccelerometerAngle(mpu.getAccX(), mpu.getAccY(), mpu.getAccZ());
+  kalman.setAngle(initialAngle);
 
   pinMode(LEFT_REN, OUTPUT);
   pinMode(LEFT_LEN, OUTPUT);
@@ -379,575 +513,45 @@ void setup() {
       ledcAttach(RIGHT_LPWM, PWM_FREQUENCY, PWM_RESOLUTION);
 
   if (!pwmOk) {
-    Serial.println("Erro ao configurar os canais PWM.");
-
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("Erro ao configurar PWM.");
+    while (true) delay(1000);
   }
 
   stopMotors();
+  startNetwork();
 
-  const BaseType_t taskCreated = xTaskCreatePinnedToCore(
-    pidLoop,
-    "Balance Kalman PD",
-    10000,
-    nullptr,
-    2,
-    &pidTaskHandle,
-    0
+  server.on("/api/health", HTTP_GET, handleHealth);
+  server.on("/api/state", HTTP_GET, handleState);
+  server.on("/api/config", HTTP_POST, handleConfig);
+  server.on("/api/reset", HTTP_POST, handleReset);
+  server.on("/api/drive", HTTP_POST, handleDrive);
+
+  server.on("/api/health", HTTP_OPTIONS, handleOptions);
+  server.on("/api/state", HTTP_OPTIONS, handleOptions);
+  server.on("/api/config", HTTP_OPTIONS, handleOptions);
+  server.on("/api/reset", HTTP_OPTIONS, handleOptions);
+  server.on("/api/drive", HTTP_OPTIONS, handleOptions);
+
+  server.begin();
+
+  const BaseType_t created = xTaskCreatePinnedToCore(
+    controlTask, "BalanceControl", 8192, nullptr, 3, &controlTaskHandle, 0
   );
 
-  if (taskCreated != pdPASS) {
-    Serial.println("Erro ao criar a tarefa de controle.");
-
+  if (created != pdPASS) {
+    Serial.println("Erro ao criar task de controle.");
     while (true) {
       stopMotors();
       delay(1000);
     }
   }
 
-  Serial.println("V18 - SP 0.285 | KD_CENTER 0.20 | SelfSP +/-0.30 | Step 0.0002");
+  Serial.println("REST pronta.");
+  Serial.println("Defaults: SP=-1.50 KP=15 KI=0 KD=0.13 PWM_MAX=180 FALL=35 LIMIT=100 PERIOD=5000");
 }
-
-// ============================================================
-// Loop principal
-// ============================================================
 
 void loop() {
-  motorControl();
+  server.handleClient();
   delay(1);
-}
-
-// ============================================================
-// Tarefa de equilibrio - 200 Hz
-// ============================================================
-
-void pidLoop(void *parameter) {
-  constexpr TickType_t PID_PERIOD_TICKS = pdMS_TO_TICKS(5);
-
-  TickType_t lastWakeTime = xTaskGetTickCount();
-  uint32_t previousMicros = micros();
-  uint32_t lastDebugMs = 0;
-
-  while (true) {
-    vTaskDelayUntil(&lastWakeTime, PID_PERIOD_TICKS);
-
-    const uint32_t nowMicros = micros();
-
-    double dt =
-        (nowMicros - previousMicros) * 0.000001;
-
-    previousMicros = nowMicros;
-
-    dt = constrain(dt, 0.003, 0.010);
-
-    mpu.update();
-
-    const double ax = mpu.getAccX();
-    const double ay = mpu.getAccY();
-    const double az = mpu.getAccZ();
-
-    accelerometerAngle =
-        calculateAccelerometerAngleX(ax, ay, az);
-
-    const double rawAccelerationMagnitude =
-        sqrt(ax * ax + ay * ay + az * az);
-
-    filteredAccelerationMagnitude +=
-        ACCEL_MAG_FILTER_ALPHA *
-        (
-          rawAccelerationMagnitude -
-          filteredAccelerationMagnitude
-        );
-
-    activeKalmanR =
-        updateAdaptiveMeasurementNoise(
-          filteredAccelerationMagnitude
-        );
-
-    angleKalman.setMeasurementNoise(activeKalmanR);
-
-    const double rawGyro =
-        mpu.getGyroX() * GYRO_DIRECTION;
-
-    filteredGyro +=
-        GYRO_FILTER_ALPHA *
-        (rawGyro - filteredGyro);
-
-    angularVelocity = filteredGyro;
-
-    input = angleKalman.update(
-      accelerometerAngle,
-      rawGyro,
-      dt
-    );
-
-    if (fabs(input) > FALL_ANGLE_DEG) {
-      error = 0.0;
-      output = 0.0;
-      filteredOutput = 0.0;
-
-      motorCommand = 0;
-      emergencyStop = true;
-
-      // Ao cair, descartamos a correcao aprendida nesta tentativa.
-      // Isso evita carregar um offset incorreto para o proximo teste.
-      selfBalanceOffset = 0.0;
-      effectiveSetpoint = setpoint;
-    } else {
-      emergencyStop = false;
-
-      effectiveSetpoint =
-          setpoint + selfBalanceOffset;
-
-      error =
-          effectiveSetpoint - input;
-
-      double controlError = error;
-
-      if (
-        fabs(controlError) <
-        ANGLE_ERROR_DEADBAND_DEG
-      ) {
-        controlError = 0.0;
-      }
-
-      const double absoluteError =
-          fabs(controlError);
-
-      updateControlParameters(absoluteError);
-
-      const double proportionalTerm =
-          activeKp * controlError;
-
-      const double dampingTerm =
-          -activeKd * angularVelocity;
-
-      const double integralTerm =
-          Ki * 0.0;
-
-      const double rawOutput =
-          proportionalTerm +
-          integralTerm +
-          dampingTerm;
-
-      const double limitedOutput =
-          constrain(
-            rawOutput,
-            -static_cast<double>(activePwmMax),
-            static_cast<double>(activePwmMax)
-          );
-
-      const double transitionFactor =
-          constrain(
-            absoluteError /
-            GAIN_TRANSITION_END_DEG,
-            0.0,
-            1.0
-          );
-
-      const double outputAlpha =
-          OUTPUT_ALPHA_CENTER +
-          (
-            OUTPUT_ALPHA_RECOVERY -
-            OUTPUT_ALPHA_CENTER
-          ) *
-          transitionFactor;
-
-      filteredOutput +=
-          outputAlpha *
-          (limitedOutput - filteredOutput);
-
-      output =
-          constrain(
-            filteredOutput,
-            -static_cast<double>(activePwmMax),
-            static_cast<double>(activePwmMax)
-          );
-
-      motorCommand =
-          static_cast<int>(lround(output));
-
-      // ========================================================
-      // SELF BALANCE - "pulo do gato"
-      //
-      // Se o robo esta quase vertical, mas o controlador continua
-      // pedindo movimento consistente, deslocamos lentamente o
-      // ponto neutro para faze-lo frear e procurar o equilibrio.
-      //
-      // IMPORTANTE:
-      // - nao aprende durante queda grande;
-      // - nao aprende com saida quase zero;
-      // - nao aprende com saida saturada;
-      // - nao aprende quando o acelerometro esta muito contaminado.
-      // ========================================================
-
-      const double absControlError =
-          fabs(controlError);
-
-      const double absOutput =
-          fabs(output);
-
-      const bool canLearnSelfBalance =
-          absControlError <= SELF_BALANCE_LEARN_WINDOW_DEG &&
-          absOutput >= SELF_BALANCE_MIN_OUTPUT &&
-          absOutput <= SELF_BALANCE_MAX_OUTPUT &&
-          accelerometerTrust >= SELF_BALANCE_MIN_ACC_TRUST;
-
-      if (canLearnSelfBalance) {
-        // Mantemos o mesmo sentido da ideia do software encontrado.
-        // Se durante o teste ele "aprende para o lado errado",
-        // basta inverter estes dois sinais.
-        if (output < 0.0) {
-          selfBalanceOffset += SELF_BALANCE_STEP;
-        } else if (output > 0.0) {
-          selfBalanceOffset -= SELF_BALANCE_STEP;
-        }
-
-        selfBalanceOffset =
-            constrain(
-              selfBalanceOffset,
-              -SELF_BALANCE_LIMIT_DEG,
-              SELF_BALANCE_LIMIT_DEG
-            );
-      }
-    }
-
-    if (millis() - lastDebugMs >= 100) {
-      lastDebugMs = millis();
-
-      Serial.print("AccAngle: ");
-      Serial.print(accelerometerAngle, 2);
-
-      Serial.print(" | Kalman: ");
-      Serial.print(input, 2);
-
-      Serial.print(" | Giro: ");
-      Serial.print(angularVelocity, 2);
-
-      Serial.print(" | |A|: ");
-      Serial.print(filteredAccelerationMagnitude, 3);
-
-      Serial.print(" g | ConfiancaAcc: ");
-      Serial.print(accelerometerTrust * 100.0, 0);
-      Serial.print("%");
-
-      Serial.print(" | R: ");
-      Serial.print(activeKalmanR, 3);
-
-      Serial.print(" | BaseSP: ");
-      Serial.print(setpoint, 3);
-
-      Serial.print(" | SelfSP: ");
-      Serial.print(selfBalanceOffset, 3);
-
-      Serial.print(" | EffSP: ");
-      Serial.print(effectiveSetpoint, 3);
-
-      Serial.print(" | Erro: ");
-      Serial.print(error, 2);
-
-      Serial.print(" | Saida: ");
-      Serial.print(output, 1);
-
-      Serial.print(" | PWM: ");
-      Serial.println(appliedMotorCommand);
-    }
-  }
-}
-
-// ============================================================
-// Angulo absoluto calculado pelo acelerometro
-// Para inclinacao ao redor do eixo X:
-// atan2(Y, Z)
-// ============================================================
-
-double calculateAccelerometerAngleX(
-  const double ax,
-  const double ay,
-  const double az
-) {
-  (void)ax;
-
-  const double angle =
-      atan2(ay, az) * RAD_TO_DEG;
-
-  return
-      angle * ACC_ANGLE_DIRECTION +
-      ACC_ANGLE_OFFSET_DEG;
-}
-
-// ============================================================
-// Ajusta dinamicamente a confianca no acelerometro
-// ============================================================
-
-double updateAdaptiveMeasurementNoise(
-  const double accelerationMagnitude
-) {
-  const double deviation =
-      fabs(accelerationMagnitude - 1.0);
-
-  const double denominator =
-      ACCEL_DEVIATION_FULL_G -
-      ACCEL_DEVIATION_START_G;
-
-  double movementFactor =
-      (
-        deviation -
-        ACCEL_DEVIATION_START_G
-      ) /
-      denominator;
-
-  movementFactor =
-      constrain(movementFactor, 0.0, 1.0);
-
-  // Curva quadratica:
-  // preserva boa confianca perto de 1 g e reduz rapidamente
-  // quando aparece aceleracao linear/centripeta.
-  const double curvedFactor =
-      movementFactor * movementFactor;
-
-  accelerometerTrust =
-      1.0 - curvedFactor;
-
-  return
-      KALMAN_R_MEASURE_NORMAL +
-      (
-        KALMAN_R_MEASURE_MOVING -
-        KALMAN_R_MEASURE_NORMAL
-      ) *
-      curvedFactor;
-}
-
-// ============================================================
-// Ganhos continuos
-// ============================================================
-
-void updateControlParameters(
-  const double absoluteError
-) {
-  const double factor =
-      constrain(
-        absoluteError /
-        GAIN_TRANSITION_END_DEG,
-        0.0,
-        1.0
-      );
-
-  activeKp =
-      KP_CENTER +
-      (KP_RECOVERY - KP_CENTER) * factor;
-
-  activeKd =
-      KD_CENTER +
-      (KD_RECOVERY - KD_CENTER) * factor;
-
-  activePwmMax =
-      static_cast<int>(
-        PWM_MAX_CENTER +
-        (
-          PWM_MAX_RECOVERY -
-          PWM_MAX_CENTER
-        ) *
-        factor
-      );
-}
-
-// ============================================================
-// Aplicacao do PWM
-// ============================================================
-
-void motorControl() {
-  if (emergencyStop) {
-    appliedMotorCommand = 0;
-    stopMotors();
-    return;
-  }
-
-  const int targetCommand =
-      constrain(
-        static_cast<int>(motorCommand),
-        -PWM_MAX_RECOVERY,
-        PWM_MAX_RECOVERY
-      );
-
-  const int currentSign =
-      commandSign(appliedMotorCommand);
-
-  const int targetSign =
-      commandSign(targetCommand);
-
-  if (
-    currentSign != 0 &&
-    targetSign != 0 &&
-    currentSign != targetSign
-  ) {
-    appliedMotorCommand =
-        moveToward(
-          appliedMotorCommand,
-          0,
-          PWM_REVERSAL_STEP
-        );
-  } else {
-    const double absoluteError =
-        fabs(error);
-
-    const double factor =
-        constrain(
-          absoluteError /
-          GAIN_TRANSITION_END_DEG,
-          0.0,
-          1.0
-        );
-
-    const int responseStep =
-        static_cast<int>(
-          PWM_STEP_CENTER +
-          (
-            PWM_STEP_RECOVERY -
-            PWM_STEP_CENTER
-          ) *
-          factor
-        );
-
-    appliedMotorCommand =
-        moveToward(
-          appliedMotorCommand,
-          targetCommand,
-          responseStep
-        );
-  }
-
-  setMotor(
-    LEFT_RPWM,
-    LEFT_LPWM,
-    appliedMotorCommand,
-    INVERT_LEFT_MOTOR,
-    PWM_MIN_LEFT_FORWARD,
-    PWM_MIN_LEFT_REVERSE
-  );
-
-  setMotor(
-    RIGHT_RPWM,
-    RIGHT_LPWM,
-    appliedMotorCommand,
-    INVERT_RIGHT_MOTOR,
-    PWM_MIN_RIGHT_FORWARD,
-    PWM_MIN_RIGHT_REVERSE
-  );
-}
-
-// ============================================================
-// Motor individual
-// ============================================================
-
-void setMotor(
-  const int rpwmPin,
-  const int lpwmPin,
-  int command,
-  const bool invert,
-  const int minForward,
-  const int minReverse
-) {
-  command =
-      constrain(
-        command,
-        -PWM_MAX_RECOVERY,
-        PWM_MAX_RECOVERY
-      );
-
-  if (invert) {
-    command = -command;
-  }
-
-  command =
-      compensateMotorDeadZone(
-        command,
-        minForward,
-        minReverse
-      );
-
-  if (command > 0) {
-    ledcWrite(rpwmPin, command);
-    ledcWrite(lpwmPin, 0);
-  } else if (command < 0) {
-    ledcWrite(rpwmPin, 0);
-    ledcWrite(lpwmPin, -command);
-  } else {
-    ledcWrite(rpwmPin, 0);
-    ledcWrite(lpwmPin, 0);
-  }
-}
-
-// ============================================================
-// Compensacao da zona morta
-// ============================================================
-
-int compensateMotorDeadZone(
-  const int command,
-  const int minForward,
-  const int minReverse
-) {
-  const int magnitude = abs(command);
-
-  if (magnitude <= PWM_ZERO_BAND) {
-    return 0;
-  }
-
-  if (
-    command > 0 &&
-    magnitude < minForward
-  ) {
-    return minForward;
-  }
-
-  if (
-    command < 0 &&
-    magnitude < minReverse
-  ) {
-    return -minReverse;
-  }
-
-  return command;
-}
-
-// ============================================================
-// Utilitarios
-// ============================================================
-
-int moveToward(
-  const int current,
-  const int target,
-  const int step
-) {
-  if (current < target) {
-    return min(current + step, target);
-  }
-
-  if (current > target) {
-    return max(current - step, target);
-  }
-
-  return current;
-}
-
-int commandSign(const int value) {
-  if (value > PWM_ZERO_BAND) {
-    return 1;
-  }
-
-  if (value < -PWM_ZERO_BAND) {
-    return -1;
-  }
-
-  return 0;
-}
-
-void stopMotors() {
-  ledcWrite(LEFT_RPWM, 0);
-  ledcWrite(LEFT_LPWM, 0);
-  ledcWrite(RIGHT_RPWM, 0);
-  ledcWrite(RIGHT_LPWM, 0);
 }
 

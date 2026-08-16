@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STARK Balancer</title>
+<style>
+*{box-sizing:border-box} body{font-family:system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px 40px;background:#111;color:#eee}
+h1{margin-bottom:4px}.muted{color:#aaa;margin-top:0}.card{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:16px;margin:14px 0}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.metric{background:#242424;border-radius:10px;padding:12px}
+.metric b{display:block;font-size:1.45rem;margin-top:5px}label{display:block;color:#bbb;font-size:.9rem;margin-bottom:5px}
+input{width:100%;font-size:1rem;padding:9px 10px;background:#101010;color:white;border:1px solid #444;border-radius:7px}
+button{padding:10px 15px;border:0;border-radius:8px;cursor:pointer;font-weight:700;margin:4px 4px 4px 0}
+.apply{background:#eee;color:#111}.reset{background:#8a2d2d;color:#fff}.small{background:#333;color:#fff}.drive{background:#333;color:#fff;min-width:110px;user-select:none;touch-action:none}.drive.active{background:#1677ff;color:#fff;box-shadow:0 0 0 3px rgba(22,119,255,.25)}.stop{background:#8a2d2d;color:#fff;min-width:110px}.ok{color:#7ee787}.bad{color:#ff7b72}
+.spbuttons{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>🤖 STARK BALANCER</h1>
+<p class="muted">Equilíbrio + controle remoto via REST</p>
+
+<div class="card">
+<label>Endereço do ESP32</label>
+<input id="baseUrl" value="http://192.168.4.1">
+<p>Status: <b id="status">desconectado</b></p>
+</div>
+
+<div class="card">
+<h2>Telemetria</h2>
+<div class="row">
+<div class="metric">Angle<b id="angle">--</b></div>
+<div class="metric">Acc Angle<b id="accAngle">--</b></div>
+<div class="metric">Gyro<b id="gyro">--</b></div>
+<div class="metric">Error<b id="error">--</b></div>
+<div class="metric">P<b id="pTerm">--</b></div>
+<div class="metric">I<b id="iTerm">--</b></div>
+<div class="metric">D<b id="dTerm">--</b></div>
+<div class="metric">PID Output<b id="pid">--</b></div>
+<div class="metric">PWM<b id="pwm">--</b></div>
+<div class="metric">Loop<b id="loopHz">--</b></div>
+<div class="metric">Estado<b id="fallen">--</b></div>
+</div>
+</div>
+
+<div class="card"><h2>Controle</h2><div style="text-align:center"><div><button class="drive" id="forward">▲ FRENTE</button></div><div><button class="drive" id="left">◀ ESQUERDA</button><button class="stop" id="stop">■ PARAR</button><button class="drive" id="right">DIREITA ▶</button></div><div><button class="drive" id="backward">▼ TRÁS</button></div></div><br><div class="row"><div><label>Move Offset (graus)</label><input id="moveOffset" type="number" step="0.05" value="0.30"></div><div><label>Turn PWM</label><input id="turnPwm" type="number" step="1" value="25"></div></div><p class="muted">Segure o botão para mover. Soltou o mouse/toque = PARAR. O botão fica azul enquanto estiver ativo. O ESP32 também para o comando se perder comunicação.</p></div>
+<div class="card">
+<h2>Calibração</h2>
+<div class="row">
+<div>
+<label>Setpoint (graus)</label><input id="setpoint" type="number" step="0.01">
+<div class="spbuttons">
+<button class="small" onclick="nudge(-0.10)">-0.10</button>
+<button class="small" onclick="nudge(-0.01)">-0.01</button>
+<button class="small" onclick="nudge(0.01)">+0.01</button>
+<button class="small" onclick="nudge(0.10)">+0.10</button>
+</div>
+</div>
+<div><label>Kp</label><input id="kp" type="number" step="0.1"></div>
+<div><label>Ki</label><input id="ki" type="number" step="0.01"></div>
+<div><label>Kd</label><input id="kd" type="number" step="0.01"></div>
+<div><label>PWM MAX</label><input id="pwmMax" type="number" step="1"></div>
+<div><label>Fall Angle (graus)</label><input id="fallAngle" type="number" step="1"></div>
+<div><label>Integral Limit</label><input id="integralLimit" type="number" step="1"></div>
+<div><label>Control Period (µs)</label><input id="controlPeriodUs" type="number" step="100"></div>
+</div>
+<br>
+<button class="apply" onclick="applyConfig()">APLICAR</button>
+<button class="reset" onclick="resetDefaults()">RESET DEFAULTS</button>
+</div>
+
+<script>
+let initialized=false;
+const el=id=>document.getElementById(id);
+const base=()=>el('baseUrl').value.replace(/\/+$/,'');
+const fmt=(v,d=2)=>Number(v).toFixed(d);
+
+async function loadState(){
+ try{
+  const r=await fetch(base()+'/api/state',{cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  const data=await r.json(), t=data.telemetry, c=data.config;
+
+  el('status').textContent='conectado'; el('status').className='ok';
+  el('angle').textContent=fmt(t.angle)+'°';
+  el('accAngle').textContent=fmt(t.accAngle)+'°';
+  el('gyro').textContent=fmt(t.gyro)+'°/s';
+  el('error').textContent=fmt(t.error)+'°';
+  el('pTerm').textContent=fmt(t.p);
+  el('iTerm').textContent=fmt(t.i);
+  el('dTerm').textContent=fmt(t.d);
+  el('pid').textContent=fmt(t.pid);
+  el('pwm').textContent=t.pwm;
+  el('loopHz').textContent=fmt(t.loopHz,1)+' Hz';
+  el('fallen').textContent=t.fallen?'FALL':'OK';
+  el('fallen').className=t.fallen?'bad':'ok';
+
+  if(!initialized){
+   el('setpoint').value=c.setpoint;
+   el('kp').value=c.kp; el('ki').value=c.ki; el('kd').value=c.kd;
+   el('pwmMax').value=c.pwmMax;
+   el('fallAngle').value=c.fallAngle;
+   el('integralLimit').value=c.integralLimit;
+   el('controlPeriodUs').value=c.controlPeriodUs; el('moveOffset').value=c.moveOffset??0.30; el('turnPwm').value=c.turnPwm??25;
+   initialized=true;
+  }
+ }catch(e){
+  el('status').textContent='sem conexão'; el('status').className='bad';
+ }
+}
+
+async function applyConfig(){
+ const body=new URLSearchParams({
+  setpoint:el('setpoint').value,kp:el('kp').value,ki:el('ki').value,kd:el('kd').value,
+  pwmMax:el('pwmMax').value,fallAngle:el('fallAngle').value,
+  integralLimit:el('integralLimit').value,controlPeriodUs:el('controlPeriodUs').value
+ });
+ const r=await fetch(base()+'/api/config',{
+  method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body
+ });
+ if(!r.ok){alert('Erro ao aplicar: HTTP '+r.status);return}
+ initialized=false; await loadState();
+}
+
+async function resetDefaults(){
+ if(!confirm('Voltar para os valores atuais de referência?')) return;
+ const r=await fetch(base()+'/api/reset',{method:'POST'});
+ if(!r.ok){alert('Erro no reset: HTTP '+r.status);return}
+ initialized=false; await loadState();
+}
+
+function nudge(delta){
+ const current=Number(el('setpoint').value||0);
+ el('setpoint').value=(current+delta).toFixed(2);
+ applyConfig();
+}
+
+
+let driveTimer=null;
+let activeDriveButton=null;
+
+async function sendDrive(command){
+ const body=new URLSearchParams({
+  command,
+  moveOffset:el('moveOffset').value,
+  turnPwm:el('turnPwm').value
+ });
+ try{
+  await fetch(base()+'/api/drive',{
+   method:'POST',
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},
+   body
+  });
+ }catch(e){}
+}
+
+function setActiveDriveButton(button){
+ document.querySelectorAll('.drive').forEach(b=>b.classList.remove('active'));
+ activeDriveButton=button;
+ if(button) button.classList.add('active');
+}
+
+function stopDrive(sendStop=true){
+ if(driveTimer){
+  clearInterval(driveTimer);
+  driveTimer=null;
+ }
+ setActiveDriveButton(null);
+ if(sendStop) sendDrive('stop');
+}
+
+function startDrive(button,command){
+ stopDrive(false);
+ setActiveDriveButton(button);
+ sendDrive(command);
+
+ // Enquanto estiver pressionado, renova o comando no ESP32.
+ driveTimer=setInterval(()=>sendDrive(command),100);
+}
+
+function bindHold(id,command){
+ const button=el(id);
+
+ button.addEventListener('pointerdown',e=>{
+  e.preventDefault();
+  try{button.setPointerCapture(e.pointerId)}catch(err){}
+  startDrive(button,command);
+ });
+
+ button.addEventListener('pointerup',e=>{
+  e.preventDefault();
+  stopDrive(true);
+ });
+
+ button.addEventListener('pointercancel',()=>stopDrive(true));
+ button.addEventListener('lostpointercapture',()=>stopDrive(true));
+ button.addEventListener('contextmenu',e=>e.preventDefault());
+}
+
+bindHold('forward','forward');
+bindHold('backward','backward');
+bindHold('left','left');
+bindHold('right','right');
+
+el('stop').addEventListener('click',()=>stopDrive(true));
+
+// Fail-safes extras: qualquer perda de foco/soltura cancela o movimento.
+window.addEventListener('pointerup',()=>stopDrive(true));
+window.addEventListener('pointercancel',()=>stopDrive(true));
+window.addEventListener('blur',()=>stopDrive(true));
+document.addEventListener('visibilitychange',()=>{
+ if(document.hidden) stopDrive(true);
+});
+
+setInterval(loadState,100);
+loadState();
+</script>
+</body>
+</html>
