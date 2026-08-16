@@ -31,8 +31,8 @@
 #include <MPU6050_light.h>
 #include <math.h>
 
-const char* WIFI_SSID = "Star_Gate";
-const char* WIFI_PASSWORD = "STARgate$321";
+const char* WIFI_SSID = "-----";
+const char* WIFI_PASSWORD = "-----";
 const char* AP_SSID = "STARK_BALANCER";
 const char* AP_PASSWORD = "starkrobot";
 
