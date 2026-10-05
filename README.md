@@ -1,141 +1,472 @@
 # 🤖 Balancing Robot ESP32
 
-> **O SIMPLES FUNCIONA E MUITO BEM!!!**
+> ## **O SIMPLES FUNCIONA E MUITO BEM!!!**
 
-Um robô de duas rodas autoequilibrado construído com **ESP32**,
-**MPU6050**, motores DC com **BTS7960** e uma interface Web para
-telemetria, ajuste do controlador em tempo real e controle remoto.
+Robô autoequilibrado de duas rodas desenvolvido com **ESP32**,
+**MPU6050**, dois motores DC com **encoders Hall**, drivers **BTS7960 /
+IBT-2** e uma **interface Web de telemetria e controle em tempo real**.
 
-Depois de várias versões experimentais, a grande virada do projeto foi
-simplificar o controle: **IMU → filtro de ângulo → PD/PID → PWM →
-motores**. Essa versão finalmente mantém o robô em pé, recupera o
-equilíbrio após pequenos empurrões e permite ajustar os parâmetros sem
-recompilar o firmware.
+O projeto nasceu como um experimento de equilíbrio e, depois de anos de
+testes, tornou-se uma plataforma de controle em cascata capaz de
+observar não apenas **se o robô está caindo**, mas também **se as rodas
+estão se deslocando quando deveriam estar paradas**.
+
+A grande virada aconteceu quando o controle foi simplificado e cada
+sensor passou a ter uma responsabilidade clara:
+
+``` text
+MPU6050  →  ângulo / queda  →  controle rápido de equilíbrio
+Encoders →  movimento       →  posição, velocidade e ajuste do neutro
+```
+
+A interface Web tornou-se parte essencial do desenvolvimento. Sem ela,
+grande parte das decisões seria baseada apenas na observação visual do
+robô. Hoje é possível enxergar, em tempo real, ângulo, giroscópio, erro,
+PID, PWM, velocidade das rodas, posição, setpoint efetivo, estado do
+aprendizado e vários outros sinais internos do controlador.
 
 ------------------------------------------------------------------------
 
 ## 🎯 Objetivo
 
-Construir uma plataforma de robótica móvel que consiga:
+Construir uma plataforma robótica móvel capaz de:
 
 -   manter-se equilibrada sobre duas rodas;
--   recuperar-se de pequenas perturbações;
+-   recuperar rapidamente o equilíbrio após perturbações;
+-   medir velocidade, direção e deslocamento das duas rodas;
+-   detectar quando está se deslocando mesmo estando próximo do ângulo
+    de equilíbrio;
+-   ajustar automaticamente seu ponto de equilíbrio;
+-   aprender e preservar um setpoint estável;
+-   adaptar-se a pequenas diferenças do piso;
+-   disponibilizar toda a telemetria importante em uma interface Web;
 -   permitir tuning do controlador em tempo real;
--   receber comandos de movimento pela rede;
--   evoluir para controle fechado de velocidade e posição usando
-    encoders;
--   servir futuramente como base para sensores, câmera, visão
-    computacional e outras experiências.
+-   receber comandos remotos com mecanismos de segurança;
+-   futuramente operar de forma totalmente embarcada usando bateria.
+
+O objetivo final não é apenas **ficar em pé**.
+
+É transformar o robô em uma **plataforma móvel autoequilibrada
+confiável**.
 
 ------------------------------------------------------------------------
 
-## 🧠 Como funciona
+# 🧠 Arquitetura atual
 
-A versão atual utiliza uma malha rápida de equilíbrio:
+O sistema possui duas responsabilidades principais.
+
+## 1. Malha rápida de equilíbrio
+
+A IMU responde à pergunta:
+
+> **"Estou caindo?"**
 
 ``` text
         MPU6050
            │
            ▼
- Acelerômetro + Giroscópio
+ Acelerômetro + Gyro
            │
            ▼
       Filtro Kalman
            │
            ▼
-       Ângulo atual
+      Ângulo atual
            │
            ▼
-        PD / PID
+      PD / PID
            │
            ▼
-         PWM base
-        /        \
-       ▼          ▼
-  BTS7960 L    BTS7960 R
-       │          │
-       ▼          ▼
-   Motor L      Motor R
+   Recovery Controller
+           │
+           ▼
+        PWM base
+       /        \
+      ▼          ▼
+ BTS7960 L    BTS7960 R
+      │          │
+      ▼          ▼
+  Motor L      Motor R
 ```
 
-O **MPU6050** fornece acelerômetro e giroscópio. O ângulo estimado
-alimenta o controlador de equilíbrio, que calcula o PWM necessário para
-manter o corpo próximo ao setpoint.
+O loop principal trabalha aproximadamente a **200 Hz**, usando:
 
-O loop de controle roda aproximadamente a **200 Hz** (`5000 µs`) e é
-separado do servidor HTTP para que a interface Web não bloqueie a malha
-de equilíbrio.
+``` cpp
+CONTROL_PERIOD_US = 5000;
+```
+
+Essa malha precisa ser rápida, previsível e independente da interface
+Web.
 
 ------------------------------------------------------------------------
 
-## ⚙️ Baseline funcional
+## 2. Malha externa baseada nos encoders
 
-Estes são os valores que marcaram a primeira versão estável do robô:
+Os encoders respondem a outra pergunta:
+
+> **"Mesmo estando próximo do ângulo correto, estou andando quando
+> deveria estar parado?"**
+
+``` text
+ Encoder L ──┐
+             ├──► velocidade / posição ──► malha externa
+ Encoder R ──┘                              │
+                                           ▼
+                              correção do ponto neutro
+                                           │
+                                           ▼
+                                  setpoint efetivo
+                                           │
+                                           ▼
+                               PID de equilíbrio
+```
+
+Essa separação foi fundamental.
+
+A IMU não precisa descobrir se o robô atravessou o chão.
+
+Os encoders não precisam descobrir se o robô está tombando.
+
+Cada sensor resolve o problema que consegue observar melhor.
+
+------------------------------------------------------------------------
+
+# ⚙️ Controlador de equilíbrio atual
+
+A referência atual de funcionamento é:
 
 ``` cpp
-setpoint = -1.50;
-Kp = 15.0;
+Kp = 16.0;
 Ki = 0.0;
-Kd = 0.13;
-PWM_MAX = 180;
+Kd = 0.22;
+
+PWM_MAX = 210;
 
 FALL_ANGLE_DEG = 35.0;
 INTEGRAL_LIMIT = 100.0;
 CONTROL_PERIOD_US = 5000;
 ```
 
-Eles também são os valores restaurados pelo botão **RESET DEFAULTS** do
-painel.
+O setpoint físico não é tratado como um número universal.
 
-> O setpoint depende da montagem física, distribuição de peso e
-> inclinação da IMU. Portanto, ele pode precisar de pequenos ajustes
-> após alterações mecânicas.
+Ele depende de:
+
+-   posição do MPU6050;
+-   distribuição de peso;
+-   estrutura mecânica;
+-   posição futura da bateria;
+-   irregularidade e inclinação do piso.
+
+Por isso o projeto evoluiu para trabalhar com um **setpoint efetivo
+adaptativo**.
 
 ------------------------------------------------------------------------
 
-## 🌐 Interface Web
+# 📐 Setpoint adaptativo
 
-Uma das partes mais importantes do projeto é o painel Web de tuning.
+O robô possui uma referência mecânica de equilíbrio, mas os encoders
+permitem encontrar pequenas correções necessárias para que ele realmente
+permaneça parado.
 
-O ESP32 expõe uma API REST e o painel roda no navegador do computador ou
-celular conectado à mesma rede.
+Conceitualmente:
 
-### Telemetria
+``` text
+Setpoint base
+     +
+Neutral Trim aprendido
+     +
+Correção temporária da malha externa
+     =
+Setpoint efetivo
+```
 
-O painel acompanha em tempo real:
+O objetivo não é fazer o setpoint mudar constantemente.
+
+A estratégia atual procura encontrar um valor que funcione e depois
+**parar de mexer nele**.
+
+------------------------------------------------------------------------
+
+# 🔒 Aprendizado do setpoint estável
+
+A evolução do controle mostrou uma regra muito simples:
+
+> **Se o robô consegue permanecer realmente parado e equilibrado durante
+> algum tempo, o setpoint atual é um bom setpoint.**
+
+O controlador possui estados semelhantes a:
+
+``` text
+🔓 PROCURANDO
+      │
+      ▼
+⏳ CONFIRMANDO
+      │
+      ▼
+🔒 TRAVADO
+```
+
+Para confirmar um setpoint, o sistema observa simultaneamente:
+
+-   velocidade das rodas;
+-   velocidade angular do giroscópio;
+-   erro angular;
+-   esforço de PWM;
+-   tempo contínuo de estabilidade.
+
+A referência atual utiliza aproximadamente **3 segundos de estabilidade
+contínua** para confirmar o ponto encontrado.
+
+Quando isso acontece:
+
+1.  o setpoint efetivo é considerado válido;
+2.  o valor é travado;
+3.  o setpoint aprendido é armazenado;
+4.  o ESP32 salva a referência em **NVS / Preferences**.
+
+Assim, uma reinicialização não significa necessariamente começar o
+aprendizado do zero.
+
+------------------------------------------------------------------------
+
+# 🧭 Detecção de mudança de terreno
+
+Um simples empurrão não deve fazer o robô esquecer o que aprendeu.
+
+Por outro lado, um piso diferente pode exigir outro ponto de equilíbrio.
+
+O sistema utiliza uma medida de **instabilidade acumulada**.
+
+Em vez de exigir que o robô derive continuamente para uma única direção,
+ele observa se precisa trabalhar repetidamente para permanecer parado.
+
+Isso é especialmente importante em pisos irregulares, onde o
+comportamento pode ser:
+
+``` text
+frente → freia → trás → freia → frente → freia...
+```
+
+Mesmo que a posição líquida não mude muito, existe evidência de que o
+ponto atual pode não ser ideal.
+
+Quando a instabilidade acumulada ultrapassa o limite configurado, o
+controlador pode liberar novamente a busca pelo neutro.
+
+Períodos de estabilidade reduzem essa evidência, evitando que um
+empurrão curto provoque reaprendizado desnecessário.
+
+------------------------------------------------------------------------
+
+# 💥 Recuperação e detecção de queda
+
+O controlador diferencia duas coisas:
+
+-   **o robô caiu**;
+-   **o setpoint aprendido deixou de existir**.
+
+Uma queda não significa automaticamente que o ponto de equilíbrio
+aprendido estava errado.
+
+Por isso, ao detectar uma queda:
+
+-   o PWM é interrompido;
+-   referências temporárias de movimento são descartadas;
+-   a posição anterior deixa de ser usada como referência;
+-   o setpoint aprendido pode ser preservado.
+
+Na interface, isso pode ser apresentado como:
+
+``` text
+💥 CAÍDO / SP PRESERVADO
+```
+
+Quando o robô volta à região válida de equilíbrio, o controlador pode
+recuperar rapidamente a operação.
+
+------------------------------------------------------------------------
+
+# 🚀 Recovery Controller
+
+O PID básico continua sendo o núcleo do sistema, mas a recuperação
+recebeu uma camada adicional.
+
+Quando o erro angular ou a velocidade angular aumentam, o controlador
+pode temporariamente ganhar mais autoridade.
+
+A recuperação utiliza:
+
+-   magnitude do erro angular;
+-   velocidade angular do giroscópio;
+-   ganho progressivo;
+-   limite de PWM aumentado durante recuperação.
+
+O objetivo é não deixar o robô excessivamente agressivo quando está
+praticamente parado, mas fornecer mais força quando realmente precisa
+voltar para a região de equilíbrio.
+
+Esse mecanismo melhorou significativamente a capacidade de recuperar o
+robô ao colocá-lo em pé ou após pequenas perturbações.
+
+------------------------------------------------------------------------
+
+# ⚙️ Encoders
+
+Os motores atuais possuem encoders Hall em quadratura.
+
+## Pinagem utilizada
+
+### Encoder esquerdo
+
+``` text
+Hall A → GPIO 18
+Hall B → GPIO 19
+```
+
+### Encoder direito
+
+``` text
+Hall A → GPIO 34
+Hall B → GPIO 35
+```
+
+> GPIO 34 e GPIO 35 do ESP32 não possuem pull-up interno.
+
+A direção dos encoders é normalizada em software para que o sistema
+trabalhe com uma convenção única:
+
+``` text
+robotSpeed > 0  → movimento para frente
+robotSpeed < 0  → movimento para trás
+robotSpeed ≈ 0  → parado
+```
+
+Os encoders fornecem atualmente:
+
+-   ticks individuais;
+-   direção;
+-   velocidade da roda esquerda;
+-   velocidade da roda direita;
+-   velocidade média do robô;
+-   posição relativa;
+-   erro de posição;
+-   informação para a malha externa;
+-   evidência de estabilidade ou instabilidade.
+
+------------------------------------------------------------------------
+
+# 🌐 Interface Web
+
+A interface Web deixou de ser apenas um painel de tuning.
+
+Ela virou um **instrumento de engenharia do projeto**.
+
+Sem a interface, seria extremamente difícil compreender o que estava
+acontecendo dentro do controlador em tempo real.
+
+Visualmente, duas situações podem parecer iguais:
+
+``` text
+robô quase parado
+```
+
+Mas internamente uma delas pode ter:
+
+``` text
+gyro baixo
+PWM baixo
+encoders parados
+erro pequeno
+```
+
+e outra:
+
+``` text
+gyro oscilando
+PWM corrigindo continuamente
+rodas indo e voltando
+posição variando
+```
+
+A interface tornou essa diferença visível.
+
+------------------------------------------------------------------------
+
+## 📊 Telemetria em tempo real
+
+O painel acompanha informações como:
+
+### Equilíbrio
 
 -   ângulo filtrado;
--   ângulo do acelerômetro;
--   velocidade angular do giroscópio;
--   erro do controlador;
--   termos P, I e D;
+-   Acc Angle;
+-   Gyro;
+-   erro angular;
+-   termo P;
+-   termo I;
+-   termo D;
 -   saída do PID;
 -   PWM;
 -   frequência do loop;
 -   estado de queda.
 
-### Tuning em tempo real
+### Encoders
 
-Sem recompilar ou reenviar o firmware, é possível alterar:
+-   Encoder L;
+-   Encoder R;
+-   velocidade L;
+-   velocidade R;
+-   velocidade média do robô;
+-   posição relativa;
+-   erro de posição.
 
--   `Setpoint`;
+### Controle adaptativo
+
+-   Setpoint Atual;
+-   Auto SP Offset;
+-   Neutral Trim;
+-   Pico Frente;
+-   Pico Trás;
+-   Ciclos de pêndulo;
+-   Estado Neutro;
+-   Setpoint Aprendido;
+-   Instabilidade Acumulada;
+-   Tempo Estável;
+-   estado da malha externa.
+
+Esses dados permitiram abandonar boa parte do ajuste por tentativa e
+erro.
+
+Hoje é possível observar **o motivo** de determinado comportamento.
+
+------------------------------------------------------------------------
+
+# 🎛️ Tuning em tempo real
+
+O painel também permite alterar parâmetros sem recompilar o firmware.
+
+Entre os parâmetros disponíveis estão:
+
 -   `Kp`;
 -   `Ki`;
 -   `Kd`;
 -   `PWM_MAX`;
--   ângulo máximo de queda;
--   limite da integral;
--   período do loop de controle.
+-   Fall Angle;
+-   Integral Limit;
+-   Control Period;
+-   parâmetros auxiliares de movimento.
 
-O setpoint possui ajustes rápidos de `±0.01°` e `±0.10°`, o que tornou
-possível encontrar o ponto de equilíbrio experimentalmente em poucos
-segundos.
+O setpoint deixou de ser tratado principalmente como um ajuste manual do
+usuário.
+
+A direção atual do projeto é permitir que o próprio robô determine
+pequenas correções necessárias usando IMU + encoders.
 
 ------------------------------------------------------------------------
 
-## 🎮 Controle remoto
+# 🎮 Controle remoto
 
-A interface também funciona como um pequeno controle remoto:
+A interface possui comandos momentâneos:
 
 ``` text
                  ▲ FRENTE
@@ -145,275 +476,343 @@ A interface também funciona como um pequeno controle remoto:
                   ▼ TRÁS
 ```
 
-Os comandos são **momentâneos**:
+Os comandos seguem uma filosofia de segurança:
 
--   pressionou → envia o comando;
--   continua pressionando → renova o comando periodicamente;
--   soltou → envia `STOP`;
--   perdeu o foco da janela → `STOP`;
--   mudou de aba → `STOP`;
--   perdeu comunicação → o ESP32 cancela o movimento por timeout.
+``` text
+pressionou          → comando ativo
+continua segurando  → comando renovado
+soltou              → STOP
+perdeu foco         → STOP
+mudou de aba        → STOP
+timeout             → STOP
+```
 
-O botão pressionado fica **azul** para indicar visualmente o comando
-ativo.
-
-Esse comportamento foi escolhido porque os motores possuem bastante
-torque e não é desejável que o robô continue se movimentando após a
-perda do comando.
-
-### Movimento atual
-
-Na implementação atual:
-
--   **frente/trás** deslocam temporariamente o setpoint;
--   **esquerda/direita** aplicam um diferencial de PWM entre os motores.
-
-Essa solução funciona para experimentação, mas revelou uma limitação
-importante: somente a IMU não informa ao controlador quanto as rodas
-realmente se deslocaram.
-
-E foi justamente essa observação que definiu a próxima grande evolução
-do projeto.
+Isso evita que uma perda de comunicação deixe os motores executando
+indefinidamente um comando anterior.
 
 ------------------------------------------------------------------------
 
-## 🔌 API REST
+## ↔️ Giro
+
+O giro utiliza diferencial entre os motores, mas passou a respeitar a
+prioridade do equilíbrio.
+
+A estratégia atual inclui:
+
+-   entrada progressiva do comando de giro;
+-   limite de autoridade;
+-   redução automática do giro quando o erro angular aumenta;
+-   prioridade absoluta para recuperar o equilíbrio.
+
+Conceitualmente:
+
+``` text
+comando DIREITA/ESQUERDA
+          │
+          ▼
+     rampa de giro
+          │
+          ▼
+   erro angular pequeno?
+      │           │
+     sim         não
+      │           │
+      ▼           ▼
+  permite      reduz giro
+    giro           │
+                   ▼
+              PID recupera
+```
+
+O comportamento melhorou significativamente, embora o refinamento de
+curvas ainda esteja em desenvolvimento.
+
+------------------------------------------------------------------------
+
+## ↕️ Frente / trás
+
+A locomoção para frente e para trás **ainda está em desenvolvimento**.
+
+Foram experimentadas estratégias de deslocamento suave do setpoint e
+inclinação controlada, mas ainda não foi encontrada uma solução
+considerada confiável.
+
+Essa parte será retomada após a instalação da bateria, quando o robô
+estiver com:
+
+-   alimentação definitiva;
+-   distribuição real de peso;
+-   centro de gravidade definitivo;
+-   ausência do cabo da fonte externa.
+
+O projeto não considera frente/trás concluído neste momento.
+
+------------------------------------------------------------------------
+
+# 🔌 API REST
+
+O ESP32 fornece uma API HTTP utilizada pela interface Web.
 
 Principais endpoints:
 
   Método   Endpoint        Função
-  -------- --------------- -----------------------------------------
-  `GET`    `/api/health`   Verifica se o ESP32 está respondendo
-  `GET`    `/api/state`    Retorna telemetria e configuração atual
-  `POST`   `/api/config`   Altera os parâmetros do controlador
-  `POST`   `/api/reset`    Restaura os valores de referência
-  `POST`   `/api/drive`    Envia comandos de movimento
+  -------- --------------- --------------------------------------------
+  `GET`    `/api/health`   Verifica se o controlador está respondendo
+  `GET`    `/api/state`    Retorna telemetria e estado atual
+  `POST`   `/api/config`   Atualiza parâmetros configuráveis
+  `POST`   `/api/reset`    Restaura parâmetros de referência
+  `POST`   `/api/drive`    Envia comandos momentâneos de movimento
 
-Exemplo de teste:
-
-``` text
-http://IP_DO_ESP32/api/health
-```
-
-Resposta esperada:
-
-``` json
-{
-  "ok": true,
-  "name": "STARK_BALANCER"
-}
-```
+A interface consulta `/api/state` continuamente para atualizar a
+telemetria.
 
 ------------------------------------------------------------------------
 
-## 📡 Rede
+# 📡 Rede
 
 O firmware tenta conectar o ESP32 à rede Wi-Fi configurada.
 
-``` cpp
-const char* WIFI_SSID = "SEU_WIFI";
-const char* WIFI_PASSWORD = "SUA_SENHA";
-```
+Se a conexão não estiver disponível, o projeto também pode utilizar um
+Access Point próprio do ESP32.
 
-Se não conseguir, o ESP32 cria seu próprio Access Point:
+O endereço IP ativo é informado pelo Serial Monitor.
 
-``` text
-SSID: STARK_BALANCER
-Senha: starkrobot
-IP: 192.168.4.1
-```
+Isso permite abrir o painel em:
 
-O endereço obtido na rede local também é exibido no Serial Monitor a
-**115200 baud**.
+-   notebook;
+-   desktop;
+-   celular;
+-   tablet conectado à mesma rede.
 
 ------------------------------------------------------------------------
 
-## 🧰 Hardware
-
-### Atual
+# 🧰 Hardware atual
 
 -   ESP32 clássico / WROOM;
 -   MPU6050;
--   2 × motores DC com caixa de redução;
+-   2 × motores GA25/JGA25-370 12 V com encoder Hall;
+-   caixa de redução aproximadamente 130 RPM;
 -   2 × drivers BTS7960 / IBT-2;
--   estrutura mecânica de duas rodas;
--   alimentação externa durante desenvolvimento.
-
-### Próximo upgrade
-
-Foram escolhidos **dois motores GA25-370 / JT-GA25-370 12 V, 130 RPM,
-com encoder integrado**.
-
-Os encoders fornecerão ao ESP32 informações que a IMU não possui:
-
--   sentido de rotação;
--   quantidade de pulsos;
--   RPM;
--   velocidade de cada roda;
--   deslocamento;
--   posição relativa.
+-   duas rodas;
+-   estrutura mecânica autoequilibrada;
+-   interface Web;
+-   alimentação externa durante a fase atual de desenvolvimento.
 
 ------------------------------------------------------------------------
 
-## 🚀 Próxima versão --- Encoders
+# 🔋 Próxima alteração física: bateria embarcada
 
-Hoje o robô sabe responder muito bem a:
+O próximo passo físico é retirar a fonte externa e instalar a bateria no
+próprio robô.
 
-> **"Estou caindo?"**
+Essa mudança é importante porque elimina:
 
-A IMU responde isso.
+-   força mecânica do cabo;
+-   variação causada pela posição do cabo;
+-   restrição física durante giros;
+-   uma condição de teste diferente da configuração final.
 
-Com os encoders, ele também poderá responder:
+Ao mesmo tempo, a bateria modifica:
 
-> **"Estou andando quando deveria estar parado?"**
+-   massa total;
+-   distribuição de peso;
+-   centro de gravidade;
+-   resposta dinâmica.
 
-A próxima arquitetura será um **controle em cascata**:
-
-``` text
-                  COMANDO
-                     │
-                     ▼
-             Velocidade desejada
-                     │
-                     ▼
-          ┌─────────────────────┐
-          │ Controle de         │
-          │ velocidade/posição  │
-          └──────────┬──────────┘
-                     │
-              Setpoint dinâmico
-                     │
-                     ▼
- MPU6050 ──► Kalman ──► PD de equilíbrio
-                     │
-                     ▼
-                  PWM base
-                 /        \
-                ▼          ▼
-             Motor L    Motor R
-                ▲          ▲
-             Encoder L  Encoder R
-                 \        /
-                  \______/
-               realimentação
-```
-
-A regra será simples:
-
-``` text
-Target Speed = 0
-```
-
-Se o robô começar a escapar para frente, os encoders detectam a
-velocidade e a malha externa modifica suavemente o setpoint para
-freá-lo.
-
-Se escapar para trás, acontece o contrário.
-
-Assim, o setpoint deixa de ser apenas um número fixo e passa a ser um
-valor **dinâmico calculado pelo controle de movimento**.
+Por isso, novos ajustes de locomoção serão realizados **depois** da
+instalação da bateria.
 
 ------------------------------------------------------------------------
 
-## 🛣️ Roadmap
+# 🛣️ Evolução do projeto
 
-### V1 --- Equilíbrio básico ✅
+## Equilíbrio básico ✅
 
--   ESP32;
--   MPU6050;
--   motores DC;
--   controle de PWM;
--   robô mantendo-se em pé.
+-   leitura do MPU6050;
+-   filtro de ângulo;
+-   PD/PID;
+-   PWM;
+-   detector de queda;
+-   robô permanecendo em pé.
 
-### V2 --- Tuning Web ✅
+## Interface Web e telemetria ✅
 
 -   API REST;
--   telemetria em tempo real;
--   alteração de `Kp`, `Ki`, `Kd`, setpoint e limites;
--   reset dos valores de referência.
+-   painel em tempo real;
+-   tuning sem recompilação;
+-   visualização do PID;
+-   visualização dos sensores;
+-   diagnóstico do comportamento físico.
 
-### V3 --- Controle remoto ✅
+## Encoders ✅
 
--   frente;
--   trás;
--   esquerda;
--   direita;
--   comandos hold-to-drive;
--   timeout de segurança.
-
-### V4 --- Encoders 🔜
-
--   leitura A/B independente;
+-   quadratura A/B;
 -   ticks;
 -   direção;
--   RPM;
--   velocidade;
--   telemetria das rodas no painel.
+-   velocidade individual;
+-   velocidade média;
+-   posição relativa;
+-   telemetria Web.
 
-### V5 --- Controle em cascata 🔜
+## Controle externo / Position Hold ✅
 
--   target speed;
--   PID/controle externo de velocidade;
--   setpoint dinâmico;
--   frenagem automática;
--   manutenção de posição;
--   melhor recuperação após perturbações.
+-   posição de referência;
+-   velocidade do robô;
+-   correção de deriva;
+-   Auto Setpoint Offset;
+-   integração entre encoders e equilíbrio.
 
-### V6 --- Plataforma autônoma 💡
+## Recovery Controller ✅
 
-Depois que a base de locomoção estiver confiável:
+-   recuperação progressiva;
+-   uso do erro angular;
+-   uso do gyro;
+-   aumento temporário de autoridade;
+-   retorno mais rápido ao equilíbrio.
 
--   bateria embarcada;
+## Adaptive Neutral / Stable Setpoint Learning ✅
+
+-   busca do neutro;
+-   observação do movimento;
+-   confirmação por estabilidade;
+-   setpoint aprendido;
+-   lock do setpoint;
+-   persistência em NVS.
+
+## Confidence / Instability Detection ✅
+
+-   distinção entre empurrão e instabilidade persistente;
+-   acúmulo de evidência;
+-   recuperação de confiança durante estabilidade;
+-   reabertura automática da busca quando necessário.
+
+## Balance Priority Steering 🧪
+
+-   giro em rampa;
+-   autoridade variável;
+-   prioridade para o equilíbrio;
+-   comportamento significativamente melhor;
+-   ainda necessita refinamento.
+
+## Frente / trás 🧪
+
+-   em desenvolvimento;
+-   será retomado após instalação da bateria.
+
+## Bateria embarcada 🔜
+
+-   retirar alimentação externa;
+-   definir posição definitiva da bateria;
+-   reavaliar centro de gravidade;
+-   testar novamente setpoint adaptativo;
+-   refinar locomoção.
+
+## Plataforma autônoma 💡
+
+Depois que a base móvel estiver confiável:
+
 -   monitoramento da bateria;
--   câmera;
 -   sensores adicionais;
+-   câmera;
 -   controle pelo celular;
 -   visão computacional;
--   reconhecimento e tracking;
+-   tracking;
+-   navegação;
 -   experimentos com IA.
-
-A regra continua sendo: **uma camada por vez, somente depois que a
-anterior estiver funcionando.**
 
 ------------------------------------------------------------------------
 
-## 🧪 Filosofia do projeto
+# 🧪 Filosofia do projeto
 
-Este projeto passou por várias tentativas com filtros, compensações,
-autoajustes e estratégias mais sofisticadas.
+Durante vários anos foram testadas estratégias cada vez mais
+sofisticadas.
 
-A versão que finalmente funcionou nasceu quando o sistema foi reduzido
-ao essencial:
+A maior evolução aconteceu quando o sistema voltou ao essencial:
 
 ``` text
 Sensor
   ↓
 Ângulo
   ↓
-PD
+PID
   ↓
 PWM
   ↓
 Motor
 ```
 
-A telemetria e o tuning em tempo real passaram a orientar as decisões
-com base no comportamento observado, em vez de adicionar complexidade
-por tentativa.
+Depois disso, novas camadas passaram a ser adicionadas somente quando
+havia um problema claramente observado.
 
-Por isso, a principal lição do projeto virou sua regra de engenharia:
+Os encoders não foram adicionados para substituir a IMU.
 
-> ## **O SIMPLES FUNCIONA E MUITO BEM!!!**
+Foram adicionados porque apareceu uma pergunta que a IMU não conseguia
+responder:
 
-Complexidade só entra quando existe um problema concreto que justifique
-sua existência.
+> **"Estou andando mesmo quando pareço equilibrado?"**
+
+O Recovery Controller apareceu porque havia outro problema concreto:
+
+> **"Consigo equilibrar, mas consigo recuperar rápido quando sou
+> perturbado?"**
+
+O aprendizado de setpoint apareceu por outro:
+
+> **"Como encontrar o neutro sem ficar ajustando manualmente para cada
+> condição?"**
+
+E a interface Web mostrou-se indispensável porque havia uma pergunta
+ainda mais básica:
+
+> **"O que realmente está acontecendo dentro do controlador neste exato
+> momento?"**
+
+A resposta passou a estar na tela.
 
 ------------------------------------------------------------------------
 
-## 🏆 O commit
+# 👁️ A importância da telemetria
 
-Depois de anos de desenvolvimento, a primeira versão realmente funcional
-ganhou o commit que merecia:
+Este projeto reforçou uma lição importante:
+
+> **Não basta observar o robô. É necessário observar o controlador.**
+
+A interface Web permitiu correlacionar o comportamento físico com:
+
+``` text
+ângulo
++
+gyro
++
+erro
++
+P / I / D
++
+PWM
++
+velocidade das rodas
++
+posição
++
+setpoint
++
+estado do aprendizado
+```
+
+Foi isso que tornou possível perceber quando uma hipótese estava errada,
+quando uma correção estava brigando com outra e quando o robô realmente
+havia encontrado uma condição estável.
+
+Sem essa visibilidade, muitos comportamentos pareciam aleatórios.
+
+Com telemetria, passaram a ser **dados**.
+
+------------------------------------------------------------------------
+
+# 🏆 O commit histórico
+
+Depois de anos de desenvolvimento, a primeira versão que realmente
+permaneceu em pé recebeu o commit:
 
 ``` text
 b44c1cf feat: balancing robot finally fucking works
@@ -421,38 +820,69 @@ b44c1cf feat: balancing robot finally fucking works
 
 Não será feito squash. 😎
 
+Esse commit faz parte da história do projeto.
+
 ------------------------------------------------------------------------
 
-## ⚠️ Segurança
+# ⚠️ Segurança
 
-Este robô utiliza motores com torque significativo.
+Este robô utiliza motores com torque significativo e pode reagir
+rapidamente.
 
 Durante desenvolvimento:
 
--   teste novas lógicas inicialmente com as rodas suspensas;
 -   mantenha uma forma rápida de cortar a alimentação;
--   use limites de PWM;
+-   segure o robô nos primeiros testes de uma nova lógica;
+-   preserve limites de PWM;
 -   preserve o detector de queda;
 -   mantenha timeout nos comandos remotos;
--   não teste próximo a escadas, animais, crianças ou objetos frágeis;
--   após instalar bateria, utilize proteção elétrica adequada.
+-   evite testes próximos a escadas;
+-   mantenha distância de animais, crianças e objetos frágeis;
+-   após instalar a bateria, utilize proteção elétrica adequada;
+-   confirme polaridade e tensão antes da primeira energização.
 
 ------------------------------------------------------------------------
 
-## ❤️ Status
+# ❤️ Estado atual
 
-**Ele finalmente fica em pé.**
+**O robô fica em pé.**
 
-Pequenos empurrões são compensados automaticamente pela malha de
-equilíbrio. A interface Web permite observar o comportamento físico do
-robô e ajustar os parâmetros em tempo real.
+Mais importante: ele não apenas permanece equilibrado em uma condição
+perfeita.
 
-Agora o objetivo não é mais descobrir como fazê-lo equilibrar.
+Ele consegue:
 
-O objetivo é transformá-lo em uma **plataforma móvel autoequilibrada
-completa**.
+-   recuperar o equilíbrio rapidamente;
+-   reagir a pequenos empurrões;
+-   medir o movimento das duas rodas;
+-   detectar deriva;
+-   ajustar o ponto neutro;
+-   reconhecer períodos reais de estabilidade;
+-   aprender um setpoint;
+-   preservar o setpoint aprendido;
+-   observar instabilidade persistente;
+-   reabrir a busca quando necessário;
+-   disponibilizar todo esse processo em tempo real pela interface Web.
+
+O giro já apresentou uma melhora muito grande, embora ainda esteja sendo
+refinado.
+
+Frente e trás continuam pendentes e serão retomados após a instalação da
+bateria.
+
+O próximo grande checkpoint será testar o sistema completamente
+embarcado, sem a fonte externa e sem o cabo interferindo mecanicamente
+no robô.
 
 ------------------------------------------------------------------------
 
-**Balancing Robot ESP32**\
+## **O SIMPLES FUNCIONA E MUITO BEM!!!**
+
+Complexidade só entra quando existe um problema concreto que justifique
+sua existência.
+
+------------------------------------------------------------------------
+
+**Balancing Robot ESP32**
+
 *Seis anos depois, o miserável finalmente ficou em pé.* 🤖🔥
