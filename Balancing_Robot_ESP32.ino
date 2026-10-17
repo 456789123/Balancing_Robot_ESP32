@@ -33,8 +33,8 @@
 #include <math.h>
 #include <Preferences.h>
 
-const char* WIFI_SSID = "Star_Gate";
-const char* WIFI_PASSWORD = "STARgate$321";
+const char* WIFI_SSID = "***";
+const char* WIFI_PASSWORD = "***";
 const char* AP_SSID = "STARK_BALANCER";
 const char* AP_PASSWORD = "starkrobot";
 
